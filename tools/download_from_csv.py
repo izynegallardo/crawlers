@@ -6,6 +6,11 @@
     whatever's in the url column to <dest-dir>/<id>.<ext>. Anything already
     on disk is skipped, so it's safe to re-run or resume.
 
+    If you get a consistent HTTP 403 here even with the correct
+    --referer, that CDN needs a real browser session (confirmed for
+    animepahe's image CDN, i.animepahe.pw) - use
+    tools/download_images_via_browser.py instead.
+
     Usage:
         python tools/download_from_csv.py animepahe/data/image_urls.csv \
             --id-column pahe_id --url-column image_url \
@@ -17,21 +22,20 @@
 
 import argparse
 import asyncio
-import csv
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from common.csv_store import read_csv_rows  # noqa: E402
 from common.downloader import download_file  # noqa: E402
 from common.throttle import human_delay  # noqa: E402
 
 
 def _load_rows(csv_path: str, id_column: str, url_column: str) -> list[dict]:
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        return [row for row in reader if row.get(id_column) and row.get(url_column)]
+    _, rows = read_csv_rows(csv_path)
+    return [row for row in rows if row.get(id_column) and row.get(url_column)]
 
 
 async def _worker(row, id_column, url_column, dest_dir, referer, semaphore, delay_range, counters):

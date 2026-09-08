@@ -7,10 +7,10 @@
 """
 
 import asyncio
-import base64
 import os
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 _DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -27,6 +27,12 @@ async def download_file(url: str, dest_path: str, referer: str | None = None) ->
         403 a request that doesn't claim to come from their own site).
         Try this before assuming you need a full browser - it's a much
         simpler fix if it's all that's blocking the request.
+
+        Confirmed NOT sufficient for animepahe's image CDN
+        (i.animepahe.pw): a real run still got HTTP 403 with the correct
+        Referer set, which rules out simple hotlink protection and points
+        to real Cloudflare-level bot protection instead. Use
+        download_via_tab() for that case.
     """
     if not url:
         return False
@@ -55,62 +61,82 @@ async def download_file(url: str, dest_path: str, referer: str | None = None) ->
 
 async def download_via_tab(tab, url: str, dest_path: str) -> bool:
     """
-        Download url using the browser tab's own fetch() instead of a
-        standalone urllib request.
+        Download url using the browser tab's own HTTP client
+        (`tab.request`), for hosts that sit behind the same bot-protection
+        as the page itself - animepahe's image CDN does (see
+        download_file()'s docstring for the confirmed 403-even-with-
+        referer result that ruled out a simpler fix).
 
-        Use this instead of download_file() whenever the asset host sits
-        behind the same bot-protection as the page (animepahe's image CDN
-        does - a bare urllib request gets silently blocked even with a
-        normal User-Agent, since it doesn't carry the browser's TLS/JS
-        fingerprint or session). Running fetch() inside the already-loaded
-        page reuses that trust instead of trying to fake it from outside.
+        `tab.request` is pydoll's browser-context HTTP client
+        (https://pydoll.tech/docs/guides/http-requests/): it runs through
+        the browser's own fetch() implementation, so it carries the
+        browser's real cookies/session/TLS fingerprint automatically -
+        that's what should get it past Cloudflare where a bare urllib
+        request couldn't.
+
+        One real wrinkle, confirmed by reading pydoll's own source
+        (pydoll/browser/requests/request.py): tab.request still executes
+        inside the *currently loaded page's* JS context, and its own
+        docstring says plainly that it "preserves browser's security
+        context and CORS policies". That means a cross-origin call - the
+        anime page (animepahe.pw) fetching an image on a different host
+        (i.animepahe.pw) - can be blocked by the browser itself if that
+        CDN doesn't send an Access-Control-Allow-Origin header for fetch
+        reads, which is a separate failure mode from Cloudflare's 403 and
+        common for CDNs that only ever expected <img src="..."> usage.
+
+        There's no way to know which wall (if either) we'll hit without a
+        live run against the real site, so this tries the cheap path
+        first and falls back automatically:
+
+        1. tab.request.get(url) as-is. Works immediately if the CDN
+           allows cross-origin fetch reads.
+        2. If that raises, navigate the tab directly to that image's own
+           host first (a plain page load, not a fetch - navigation isn't
+           subject to CORS at all). Retry tab.request from there: it's
+           now a same-origin request, which browsers never block for
+           CORS. Once that's worked once, the tab stays parked on that
+           host, so later calls to other URLs on the same host skip the
+           extra navigation and go straight to tab.request.
     """
     if not url:
         return False
 
-    script = (
-        "return fetch(" + repr(url) + ").then(r => {"
-        "if (!r.ok) throw new Error('HTTP ' + r.status);"
-        "return r.arrayBuffer();"
-        "}).then(buf => {"
-        "const bytes = new Uint8Array(buf);"
-        "let binary = '';"
-        "for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);"
-        "return btoa(binary);"
-        "});"
-    )
+    host = urlsplit(url).netloc
+    parked_host = getattr(tab, "_download_via_tab_parked_host", None)
+
+    if parked_host != host:
+        try:
+            response = await tab.request.get(url)
+            return _write_response(response, dest_path, url)
+        except Exception as e:
+            print(
+                f"<info> download_via_tab: fetch from the current page failed for {url} "
+                f"({e}) - retrying via a same-origin navigation instead"
+            )
+            try:
+                await tab.go_to(url)
+            except Exception as nav_e:
+                print(f"<warn> download_via_tab: navigation fallback failed for {url}: {nav_e}")
+                return False
+            setattr(tab, "_download_via_tab_parked_host", host)
 
     try:
-        result = await tab.execute_script(script, return_by_value=True, await_promise=True)
+        response = await tab.request.get(url)
     except Exception as e:
-        print(f"<warn> download_via_tab script failed for {url}: {e}")
+        print(f"<warn> download_via_tab request failed for {url}: {e}")
         return False
 
-    b64_data = _unwrap_script_result(result)
-    if not b64_data:
-        print(f"<warn> download_via_tab got no data for {url} (raw result: {result!r})")
+    return _write_response(response, dest_path, url)
+
+
+def _write_response(response, dest_path: str, url: str) -> bool:
+    if not response.ok:
+        print(f"<warn> download_via_tab got HTTP {response.status_code} for {url}")
         return False
 
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     with open(dest_path, "wb") as f:
-        f.write(base64.b64decode(b64_data))
+        f.write(response.content)
 
     return True
-
-
-def _unwrap_script_result(result):
-    """Pydoll's execute_script return shape has varied by version -
-    sometimes the raw value, sometimes nested like
-    {"result": {"result": {"value": ...}}}. Walk down defensively
-    instead of assuming one fixed shape.
-    """
-    value = result
-    for _ in range(3):
-        if isinstance(value, dict) and "value" in value:
-            value = value["value"]
-            break
-        if isinstance(value, dict) and "result" in value:
-            value = value["result"]
-            continue
-        break
-    return value if isinstance(value, str) else None

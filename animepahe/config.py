@@ -3,8 +3,8 @@ from datetime import date
 BASE_URL = "https://animepahe.pw"
 INDEX_URL = f"{BASE_URL}/anime"
 TODAY = date.today().strftime("%Y%m%d")
-CSV_PATH = f"animepahe/data/{TODAY}.csv"
-IMAGE_URLS_CSV = f"animepahe/data/images/{TODAY}.csv"
+CSV_PATH = f"animepahe/data/anime.csv"
+IMAGE_URLS_CSV = f"animepahe/data/images.csv"
 
 # "hash" is the "#" tab (titles that start with a digit/symbol), then A-Z.
 # Matches the tab-pane ids exactly (href="#A" -> id="A", href="#hash" -> id="hash").

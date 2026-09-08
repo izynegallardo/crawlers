@@ -113,7 +113,19 @@ def _parse_index_entries(pane) -> list[dict]:
         entries.append(
             {
                 "pahe_id": pahe_id,
-                "title": a.get("title") or a.get_text(strip=True),
+                # get_text() FIRST, title attribute as fallback only - not
+                # the other way around. Confirmed via a real run: every
+                # title containing an embedded " (e.g. 'Tis Time for
+                # "Torture," Princess) came back truncated at that quote
+                # when read from a.get("title"), because animepahe's raw
+                # HTML doesn't escape internal quotes inside the title=""
+                # attribute and html.parser (unlike a real browser) takes
+                # that literally, ending the attribute value early. The
+                # anchor's visible text is plain character data, not an
+                # attribute value, so it isn't subject to that at all - it
+                # always comes through complete regardless of what
+                # punctuation the title contains.
+                "title": a.get_text(strip=True) or a.get("title"),
                 "url": urljoin(BASE_URL, href),
             }
         )
@@ -187,9 +199,29 @@ def _parse_info_sidebar(container) -> dict:
         tripping through csv.DictWriter/DictReader). external_links comes
         back as a JSON-encoded list of {name, url}, since each link's
         target is real, useful data, not just a label.
+
+        All five of those always end up as valid JSON, even "[]" when the
+        anime genuinely has no Studios/Themes/Demographic/genre/external
+        links section at all - never left as a bare None/empty cell. That
+        distinction matters for patch_columns.py: it treats "studios
+        parses as JSON" as "already patched", so a field that's legitimately
+        empty has to still be valid JSON, or that row would be re-scraped
+        forever without ever being recognized as done.
+
+        Confirmed via real scrapes: animepahe singularizes "Theme:" and
+        (presumably) "Demographic:" when there's exactly one value, and
+        pluralizes for 2+ (e.g. Berserk's "Themes: Gore, Military,
+        Psychological" vs .hack//G.U. Trilogy's "Theme: Video Game"). Both
+        label forms are matched below - matching only the plural silently
+        dropped every single-value theme, which is a common case, not an
+        edge case.
     """
     result = {field: None for field in _INFO_FIELDS}
+    list_fields = ("studios", "themes", "demographics", "external_links", "genres")
+
     if not container:
+        for field in list_fields:
+            result[field] = json.dumps([], ensure_ascii=False)
         return result
 
     for p in container.find_all("p", recursive=False):
@@ -230,9 +262,9 @@ def _parse_info_sidebar(container) -> dict:
             # those instead of guessing at comma placement.
             studios = link_texts if link_texts else [s.strip() for s in value.split(",") if s.strip()]
             result["studios"] = json.dumps(studios, ensure_ascii=False)
-        elif label == "themes":
+        elif label in ("theme", "themes"):
             result["themes"] = json.dumps(link_texts, ensure_ascii=False)
-        elif label == "demographic":
+        elif label in ("demographic", "demographics"):
             result["demographics"] = json.dumps(link_texts, ensure_ascii=False)
         elif label == "external links":
             links = [
@@ -242,9 +274,16 @@ def _parse_info_sidebar(container) -> dict:
             result["external_links"] = json.dumps(links, ensure_ascii=False)
 
     genre_ul = container.select_one(".anime-genre ul")
-    if genre_ul:
-        genres = [a.get_text(strip=True) for a in genre_ul.find_all("a")]
-        result["genres"] = json.dumps(genres, ensure_ascii=False)
+    genres = [a.get_text(strip=True) for a in genre_ul.find_all("a")] if genre_ul else []
+    result["genres"] = json.dumps(genres, ensure_ascii=False)
+
+    # Any of the other list-type fields that never matched a label on this
+    # particular page (no Studios/Themes/Demographic/External Links section
+    # at all) are still None here - normalize those to an empty JSON array
+    # too, for the same reason as genres above.
+    for field in ("studios", "themes", "demographics", "external_links"):
+        if result[field] is None:
+            result[field] = json.dumps([], ensure_ascii=False)
 
     return result
 
